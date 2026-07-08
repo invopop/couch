@@ -46,6 +46,12 @@ func TestNewShardingByYearWithStatic(t *testing.T) {
 	assert.Equal(t, "test_%s", sr.Template())
 }
 
+func TestShardByYearFutureStart(t *testing.T) {
+	// A start year beyond next year must not panic; it yields no year shards.
+	assert.Empty(t, couch.NewShardByYear("test", 9999).List())
+	assert.Equal(t, []string{"static"}, couch.NewShardByYearWithStatic("test", 9999, "static").List())
+}
+
 func TestShardingByYearKey(t *testing.T) {
 	sr := couch.NewShardByYear("test", 2020)
 

@@ -4,7 +4,15 @@ import (
 	"testing"
 
 	"github.com/invopop/couch"
+	"github.com/stretchr/testify/assert"
 )
+
+func TestChecksumIgnoresNilView(t *testing.T) {
+	d := couch.NewDesign("test")
+	d.SetView("ok", &couch.View{Map: "function(doc) {}"})
+	d.Views["broken"] = nil // a nil entry must not panic the checksum
+	assert.NotPanics(t, func() { _ = d.Checksum() })
+}
 
 func TestDesignInstantiation(t *testing.T) {
 	design := couch.NewDesign("test")

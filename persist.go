@@ -22,6 +22,9 @@ type Persistable interface {
 // Fetch wraps around the kivik persistence methods to update the model
 // with the data from the database or raise an error if it does not exist.
 func Fetch(ctx context.Context, db *kivik.DB, d Persistable) error {
+	if d.GetID() == "" {
+		return errors.New("cannot fetch model without ID")
+	}
 	err := db.Get(ctx, d.GetID()).ScanDoc(d)
 	if err != nil {
 		return fmt.Errorf("fetch %s/%s: %w", db.Name(), d.GetID(), mapKivikError(err))

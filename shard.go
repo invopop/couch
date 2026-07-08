@@ -16,6 +16,8 @@ type Shardable interface {
 // of a type of object.
 type ShardRules interface {
 	// Template provides the base name into which the shard will be inserted.
+	// It must be an fmt.Sprintf format string with a single %s verb where
+	// the shard name is substituted (see NewShards).
 	Template() string
 
 	// List provides an array of acceptable shards

@@ -88,6 +88,9 @@ func (d *Design) viewConcat() string {
 	sort.Strings(keys)
 	for _, k := range keys {
 		view := d.Views[k]
+		if view == nil {
+			continue
+		}
 		items = append(items, k, "map", view.Map, "reduce", view.Reduce)
 	}
 	return strings.Join(items, ":")

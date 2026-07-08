@@ -78,10 +78,11 @@ func (s *ShardByYear) List() []string {
 
 func (s *ShardByYear) generateList() []string {
 	ym := time.Now().Year() + 1
-	yd := ym - s.start
-	ys := make([]string, yd+1)
-	for i := 0; i <= yd; i++ {
-		ys[i] = strconv.Itoa(ym - i)
+	// Iterate newest-first down to start. A start beyond next year simply
+	// yields no year shards rather than a negative-length panic.
+	ys := make([]string, 0)
+	for y := ym; y >= s.start; y-- {
+		ys = append(ys, strconv.Itoa(y))
 	}
 	if s.static != "" {
 		ys = append([]string{s.static}, ys...)

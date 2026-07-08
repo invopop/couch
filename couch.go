@@ -43,17 +43,21 @@ func (c *Client) Ping(ctx context.Context) error {
 	limit := 10
 	for i := 0; i <= limit; i++ {
 		_, err := c.client.Ping(ctx)
-		switch kivik.HTTPStatus(err) {
-		case 0:
+		if err == nil {
 			return nil
-		case 408, 504:
+		}
+		switch kivik.HTTPStatus(err) {
+		case 408, 504, 0:
+			// Transient: request timeouts and transport/network errors
+			// (status 0) — the server may still be coming up. Retry.
 			select {
 			case <-time.After(1 * time.Second):
-				continue // try again
+				continue
 			case <-ctx.Done():
 				return errors.New("request canceled")
 			}
 		default:
+			// A definitive HTTP status (e.g. 401): don't retry.
 			return err
 		}
 	}
