@@ -4,7 +4,6 @@ package couch
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -40,28 +39,30 @@ func New(conf *Config, opts ...kivik.Option) (*Client, error) {
 // after the client has been initialized to ensure the connection
 // is ready to use.
 func (c *Client) Ping(ctx context.Context) error {
-	limit := 10
-	for i := 0; i <= limit; i++ {
-		_, err := c.client.Ping(ctx)
-		if err == nil {
+	const attempts = 10
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			// Back off between attempts (not before the first, not after the last).
+			select {
+			case <-time.After(1 * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if _, err = c.client.Ping(ctx); err == nil {
 			return nil
 		}
 		switch kivik.HTTPStatus(err) {
 		case 408, 504, 0:
 			// Transient: request timeouts and transport/network errors
 			// (status 0) — the server may still be coming up. Retry.
-			select {
-			case <-time.After(1 * time.Second):
-				continue
-			case <-ctx.Done():
-				return errors.New("request canceled")
-			}
 		default:
 			// A definitive HTTP status (e.g. 401): don't retry.
 			return err
 		}
 	}
-	return fmt.Errorf("failed after %d retries", limit)
+	return fmt.Errorf("couch: ping failed after %d attempts: %w", attempts, err)
 }
 
 // DB is used to provide a database instance at the provided name.

@@ -71,10 +71,10 @@ func main() {
 
 	got := &Widget{}
 	got.SetID("widget-1")
-	if err := couch.Fetch(ctx, db, got); err != nil {
-		if errors.Is(err, couch.ErrNotFound) {
-			log.Println("not found")
-		}
+	switch err := couch.Fetch(ctx, db, got); {
+	case errors.Is(err, couch.ErrNotFound):
+		log.Println("not found")
+	case err != nil:
 		log.Fatal(err)
 	}
 }

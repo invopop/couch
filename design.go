@@ -24,7 +24,7 @@ type Design struct {
 	Model
 	Language string `json:"language"`
 
-	// Options stor additional options for the design document.
+	// Options stores additional options for the design document.
 	Options map[string]any `json:"options,omitempty"`
 
 	Filters map[string]string `json:"filters,omitempty"`

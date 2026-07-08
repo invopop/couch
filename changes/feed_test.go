@@ -12,7 +12,7 @@ import (
 func newBareFeed(opts ...Option) *feed {
 	f := &feed{
 		Seq:         "0",
-		saveTimeout: make(chan bool),
+		saveTimeout: make(chan bool, 1),
 		opts:        newOptions(),
 		fatal:       make(chan error, 1),
 	}

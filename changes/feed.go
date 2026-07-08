@@ -136,7 +136,7 @@ func New(changesDB, srcDB *kivik.DB, opts ...Option) Feed {
 		Seq:         "0",
 		db:          srcDB,
 		changesDB:   changesDB,
-		saveTimeout: make(chan bool),
+		saveTimeout: make(chan bool, 1),
 		count:       0,
 		started:     false,
 		opts:        newOptions(),
@@ -302,6 +302,8 @@ func (f *feed) nextItem(ctx context.Context) (feedItem, error) {
 			return feedItem{}, err
 		}
 		select {
+		case <-ctx.Done():
+			return feedItem{}, ctx.Err()
 		case item, more := <-f.outgoing:
 			if !more {
 				return feedItem{}, nil // the end
@@ -310,7 +312,9 @@ func (f *feed) nextItem(ctx context.Context) (feedItem, error) {
 			f.lastID = item.id
 			return item, nil
 		case <-f.saveTimeout:
-			// force a loop around so we try to save
+			// Timer fired: clear it so shouldSave() triggers on the next
+			// loop, then loop around to save.
+			f.stopSaveTimer()
 			continue
 		}
 	}
@@ -335,6 +339,8 @@ func (f *feed) startWithCallbacks() {
 					return f.opts.callback(i.id)
 				})
 			case <-f.saveTimeout:
+				// Timer fired: clear it so the save below runs.
+				f.stopSaveTimer()
 				break maxInFlightLoop
 			}
 		}
@@ -342,7 +348,7 @@ func (f *feed) startWithCallbacks() {
 			f.log.Error().Err(err).Msg("closing due to errors")
 			return
 		}
-		ctx := context.Background() // indpendent context
+		ctx := context.Background() // independent context
 		if err := f.save(ctx); err != nil {
 			f.log.Error().Err(err).Msg("failed to save sequence position, ignoring")
 		}
@@ -366,12 +372,16 @@ func (f *feed) startSaveTimer() {
 	if f.delay != nil {
 		return
 	}
+	// The callback only nudges the consumer; it must not touch f.delay (that
+	// would race with the consumer goroutine). The consumer clears the timer
+	// when it observes the notification. The send is non-blocking against a
+	// buffered channel, so a fired timer never blocks or leaks its goroutine
+	// even if no consumer is currently selecting.
 	f.delay = time.AfterFunc(f.opts.storeTimeout, func() {
-		if f.delay != nil {
-			f.delay.Stop()
-			f.delay = nil
+		select {
+		case f.saveTimeout <- true:
+		default:
 		}
-		f.saveTimeout <- true
 	})
 }
 
