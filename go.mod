@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-kivik/kivik/v4 v4.5.2
+	github.com/invopop/at v0.1.0
 	github.com/jpillora/backoff v1.0.0
 	github.com/rs/zerolog v1.35.1
 	github.com/stretchr/testify v1.11.1

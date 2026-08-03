@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/go-kivik/kivik/v4"
-	"github.com/invopop/couch/at"
+	"github.com/invopop/at"
 )
 
 // Model is a standard representation of a model to be stored in CouchDB
