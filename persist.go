@@ -38,9 +38,18 @@ func FetchModel(ctx context.Context, db *kivik.DB, m Persistable) error {
 }
 
 // Store attempts to persist the provided persistable object to the database.
+//
+// A model carrying the `_deleted` marker (see Model.Deleted) is refused:
+// putting it back is how CouchDB deletes a document, and a save that silently
+// deletes instead would be a nasty way to find that out. Deletions read from a
+// change feed are meant to be reacted to, not written; use Delete to remove a
+// document.
 func Store(ctx context.Context, db *kivik.DB, m Persistable) error {
 	if m.GetID() == "" {
 		return errors.New("cannot store model without ID")
+	}
+	if d, ok := m.(interface{ GetDeleted() bool }); ok && d.GetDeleted() {
+		return fmt.Errorf("cannot store %s: model is marked as deleted", m.GetID())
 	}
 	m.UpdateTimestamps()
 	rev, err := db.Put(ctx, m.GetID(), m)

@@ -97,6 +97,30 @@ if err := client.SyncDesigns(ctx, db, []*couch.Design{d}); err != nil {
 See [`changes`](./changes) for consuming a database's `_changes` feed with a
 resumable cursor. Sharding helpers (`ShardByYear`, …) live in the root package.
 
+`Next` describes each change rather than just naming it, so deletions are
+reported instead of dropped:
+
+```go
+for {
+    c, err := feed.Next(ctx)
+    if err != nil { /* retry */ }
+    if c.ID == "" { break } // feed stopped
+
+    if c.Deleted {
+        // A tombstone: nothing left to fetch, and anything mirroring this
+        // document downstream should drop its copy.
+        continue
+    }
+    // load and process c.ID
+}
+```
+
+That covers documents removed by hand in the database as much as those the
+application deleted. `Model.Deleted` carries the same `_deleted` marker, so a
+tombstone read from a feed, a view or a fetch arrives as a model rather than a
+bare ID — and `Store` refuses to persist one, since writing `_deleted` back is
+how a document gets deleted.
+
 ## License
 
 Apache 2.0 — see [LICENSE](./LICENSE).

@@ -39,25 +39,25 @@ func (f *fakeFeed) Seed(_ context.Context, _ string) error { return nil }
 func (f *fakeFeed) Start(_ context.Context) {
 	f.startCnt.Add(1)
 }
-func (f *fakeFeed) Next(ctx context.Context) (string, error) {
+func (f *fakeFeed) Next(ctx context.Context) (Change, error) {
 	if f.stopped.Load() {
-		return "", nil
+		return Change{}, nil
 	}
 	if f.cur < len(f.ids) {
 		id := f.ids[f.cur]
 		f.cur++
-		return id, nil
+		return Change{ID: id}, nil
 	}
 	select {
 	case <-f.stopCh:
-		return "", nil
+		return Change{}, nil
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return Change{}, ctx.Err()
 	}
 }
 func (f *fakeFeed) NextDoc(ctx context.Context) (string, json.RawMessage, error) {
-	id, err := f.Next(ctx)
-	return id, nil, err
+	c, err := f.Next(ctx)
+	return c.ID, nil, err
 }
 func (f *fakeFeed) Stop() {
 	if f.stopped.CompareAndSwap(false, true) {
@@ -91,8 +91,8 @@ func waitUntil(t *testing.T, deadline time.Duration, cond func() bool, msg strin
 func TestFlatWorkerPool_AllItemsDelivered(t *testing.T) {
 	feed := newFakeFeed("test", "a", "b", "c", "d")
 	feeds := map[string]Feed{"test": feed}
-	pool := NewFlatWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
-		return id, nil
+	pool := NewFlatWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
+		return c.ID, nil
 	}, 2)
 	pool.Start(context.Background())
 	defer pool.Stop()
@@ -140,8 +140,8 @@ func TestHashedWorkerPool_SameKeyAlwaysSameWorker(t *testing.T) {
 	}
 	feed := newFakeFeed("test", ids...)
 	feeds := map[string]Feed{"test": feed}
-	pool := NewHashedWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
-		return id, nil
+	pool := NewHashedWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
+		return c.ID, nil
 	}, 4, func(s string) string { return "entry-a" })
 	pool.Start(context.Background())
 	defer pool.Stop()
@@ -195,11 +195,11 @@ func TestWorkerPool_FetcherErrorIsRetried(t *testing.T) {
 	feed := newFakeFeed("test", "doc-1")
 	feeds := map[string]Feed{"test": feed}
 	var attempts atomic.Int32
-	pool := NewFlatWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
+	pool := NewFlatWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
 		if attempts.Add(1) < 3 {
 			return "", errors.New("transient")
 		}
-		return id, nil
+		return c.ID, nil
 	}, 1)
 	// Tighten the backoff for the test so the retry happens quickly.
 	pool.Start(context.Background())
@@ -220,8 +220,8 @@ func TestWorkerPool_FetcherErrorIsRetried(t *testing.T) {
 func TestWorkerPool_FatalFromFeedSurfaces(t *testing.T) {
 	feed := newFakeFeed("test")
 	feeds := map[string]Feed{"test": feed}
-	pool := NewFlatWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
-		return id, nil
+	pool := NewFlatWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
+		return c.ID, nil
 	}, 1)
 	pool.Start(context.Background())
 	defer pool.Stop()
@@ -245,8 +245,8 @@ func TestWorkerPool_FatalFromFeedSurfaces(t *testing.T) {
 func TestWorkerPool_StopClosesWorkerChannelsCleanly(t *testing.T) {
 	feed := newFakeFeed("test", "a")
 	feeds := map[string]Feed{"test": feed}
-	pool := NewFlatWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
-		return id, nil
+	pool := NewFlatWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
+		return c.ID, nil
 	}, 2)
 	pool.Start(context.Background())
 
@@ -272,8 +272,8 @@ func TestWorkerPool_StopClosesWorkerChannelsCleanly(t *testing.T) {
 func TestWorkerPool_StopWithoutFatalClosesFatalChannel(t *testing.T) {
 	feed := newFakeFeed("test")
 	feeds := map[string]Feed{"test": feed}
-	pool := NewFlatWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
-		return id, nil
+	pool := NewFlatWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
+		return c.ID, nil
 	}, 1)
 	pool.Start(context.Background())
 	pool.Stop()
@@ -292,8 +292,8 @@ func TestWorkerPool_MultipleFeedsAllRun(t *testing.T) {
 	feedA := newFakeFeed("a", "doc-a-1", "doc-a-2")
 	feedB := newFakeFeed("b", "doc-b-1", "doc-b-2", "doc-b-3")
 	feeds := map[string]Feed{"a": feedA, "b": feedB}
-	pool := NewFlatWorkerPool(feeds, func(_ context.Context, id string) (string, error) {
-		return id, nil
+	pool := NewFlatWorkerPool(feeds, func(_ context.Context, c Change) (string, error) {
+		return c.ID, nil
 	}, 2)
 	pool.Start(context.Background())
 	defer pool.Stop()
@@ -333,7 +333,7 @@ func TestWorkerPool_MultipleFeedsAllRun(t *testing.T) {
 
 func TestWorkerPool_NonPositiveWorkersNormalised(t *testing.T) {
 	feeds := map[string]Feed{"test": newFakeFeed("test")}
-	fetcher := func(_ context.Context, id string) (string, error) { return id, nil }
+	fetcher := func(_ context.Context, c Change) (string, error) { return c.ID, nil }
 
 	if p := NewFlatWorkerPool(feeds, fetcher, 0); p.Workers() != 1 {
 		t.Fatalf("flat: workers normalised to 1, got %d", p.Workers())

@@ -18,8 +18,27 @@ type Model struct {
 	// model. Without this placeholder, they'll get deleted after an update.
 	Attachments kivik.Attachments `json:"_attachments,omitempty"`
 
+	// Deleted reflects CouchDB's `_deleted` marker: true means this is a
+	// tombstone rather than a document. It is set when reading a deletion —
+	// from a change feed started WithDeletions, or anywhere else a tombstone
+	// surfaces — so consumers can react to a document being removed, including
+	// one deleted by hand in the database.
+	//
+	// It is read-only in practice: Store refuses to persist a model carrying
+	// it, since writing `_deleted` back is how a document gets deleted and
+	// having that happen as a side effect of a save would be surprising. Use
+	// Delete instead.
+	Deleted bool `json:"_deleted,omitempty"`
+
 	CreatedAt at.Timestamp `json:"created_at"`
 	UpdatedAt at.Timestamp `json:"updated_at"`
+}
+
+// GetDeleted reports whether the model represents a deleted document, so
+// persistence layers can check the marker through an interface rather than
+// depending on the concrete type.
+func (m *Model) GetDeleted() bool {
+	return m.Deleted
 }
 
 // UpdateTimestamps ensures the model's created and update at stamps are set.
