@@ -63,28 +63,37 @@ type Feed interface {
 	// document.
 	Seed(ctx context.Context, seq string) error
 
-	// Next grabs the next ID from the change feed. If there is an error, it'll
-	// be provided. If the feed is stopped, the ID will be empty and there will
-	// not be an error.
-	Next(ctx context.Context) (string, error)
+	// Next grabs the next change from the feed, describing it rather than just
+	// naming it so a consumer can tell a deletion from an update. If there is
+	// an error, it'll be provided. If the feed is stopped, the Change will be
+	// zero (an empty ID) and there will not be an error.
+	//
+	// Deletions are reported like any other change, with Deleted set. A
+	// consumer that fetches each ID must handle that case: the document is a
+	// tombstone by then and fetching it will fail.
+	Next(ctx context.Context) (Change, error)
 
-	// NextDoc behaves like Next but also returns the changed document's body
-	// when the feed was created with WithIncludeDocs. The body is nil when
-	// include_docs was not requested, or when it could not be read for this
-	// change (in which case the consumer should fetch the document itself).
-	// Acknowledgement semantics are identical to Next.
+	// NextDoc returns the next changed document's ID and body, skipping
+	// deletions — there is no body to return for a tombstone. Acknowledgement
+	// semantics are identical to Next. The body is nil when the feed was not
+	// created WithIncludeDocs, or when it could not be read for this change (in
+	// which case the consumer should fetch the document itself).
+	//
+	// Deprecated: use Next, which reports deletions instead of hiding them.
+	// Silently dropping them is how downstream copies of deleted documents end
+	// up living forever.
 	NextDoc(ctx context.Context) (id string, doc json.RawMessage, err error)
 
 	// Stop requests that we stop listening for new changes. The current call to
-	// Next should then return an empty ID.
+	// Next should then return a zero Change.
 	Stop()
 
 	// Fatal returns a channel that fires when the feed has detected an
 	// unrecoverable condition such as a persistent conflict on the
 	// sequence document (only when WithFatalOnConflict is set). When
 	// fatal is signalled the feed self-stops, so a follow-up Next will
-	// return ("", nil) as for a normal close. The channel is closed when
-	// the feed is stopped.
+	// return a zero Change as for a normal close. The channel is closed
+	// when the feed is stopped.
 	Fatal() <-chan error
 }
 
@@ -93,12 +102,33 @@ type Feed interface {
 // and will wait for all currently executing callbacks to be processed before
 // storing the current sequence. Any errors return from the callback will cause
 // the Feed to be closed, so should only be used for major issues.
-type FeedCallback func(id string) error
+//
+// Deletions are delivered like any other change, so the callback has to check
+// Change.Deleted before treating the ID as a document it can load.
+type FeedCallback func(c Change) error
+
+// Change describes a single entry from the feed.
+type Change struct {
+	// ID of the document that changed.
+	ID string
+
+	// Deleted is true when the change is a deletion: the document is now a
+	// tombstone, so there is nothing left to fetch and consumers mirroring the
+	// data should remove their copy.
+	Deleted bool
+
+	// Doc holds the document body when the feed was created with
+	// WithIncludeDocs, and is nil otherwise or when the body could not be
+	// read. For a deletion CouchDB sends the tombstone, which carries the id,
+	// the rev and `_deleted`, and none of the document's own fields.
+	Doc json.RawMessage
+}
 
 type feedItem struct {
-	id  string
-	seq string
-	doc json.RawMessage // populated only when include_docs is enabled
+	id      string
+	seq     string
+	deleted bool
+	doc     json.RawMessage // populated only when include_docs is enabled
 }
 
 type feed struct {
@@ -253,21 +283,33 @@ func (f *feed) signalFatal(err error) {
 	}
 }
 
-// Next provides the next ID. This acts as an Ack as the current
-// sequence state will not be saved until next is called again.
-// Any errors that happen while trying to save the feed state
-// or read from the source will be returned here.
-func (f *feed) Next(ctx context.Context) (string, error) {
+// Next provides the next change, deletions included. This acts as an Ack as
+// the current sequence state will not be saved until next is called again.
+// Any errors that happen while trying to save the feed state or read from the
+// source will be returned here.
+func (f *feed) Next(ctx context.Context) (Change, error) {
 	item, err := f.nextItem(ctx)
-	return item.id, err
+	return Change{ID: item.id, Deleted: item.deleted, Doc: item.doc}, err
 }
 
-// NextDoc behaves like Next but also returns the changed document's body
-// (see the Feed interface). The body is only populated when the feed was
-// created with WithIncludeDocs.
+// NextDoc returns the next changed document's ID and body, skipping deletions
+// (see the Feed interface).
+//
+// Deprecated: use Next.
 func (f *feed) NextDoc(ctx context.Context) (string, json.RawMessage, error) {
-	item, err := f.nextItem(ctx)
-	return item.id, item.doc, err
+	for {
+		item, err := f.nextItem(ctx)
+		if err != nil || item.id == "" {
+			return item.id, item.doc, err
+		}
+		if item.deleted {
+			// A tombstone has no body to hand back. Acking it and moving on
+			// keeps the old contract — at the cost of the consumer never
+			// learning the document is gone, which is why this is deprecated.
+			continue
+		}
+		return item.id, item.doc, nil
+	}
 }
 
 // nextItem is the shared implementation behind Next and NextDoc. It acts
@@ -336,7 +378,7 @@ func (f *feed) startWithCallbacks() {
 				f.setSeq(item.id, item.seq)
 				i := item
 				g.Go(func() error {
-					return f.opts.callback(i.id)
+					return f.opts.callback(Change{ID: i.id, Deleted: i.deleted, Doc: i.doc})
 				})
 			case <-f.saveTimeout:
 				// Timer fired: clear it so the save below runs.
@@ -524,11 +566,10 @@ func (f *feed) processNext() error {
 		}
 
 		docID := f.source.ID()
-		if f.source.Deleted() || docID == "" || strings.HasPrefix(docID, "_") {
+		if docID == "" || strings.HasPrefix(docID, "_") {
 			continue // ignore things we can't deal with
 		}
-
-		item := feedItem{id: docID, seq: f.source.Seq()}
+		item := feedItem{id: docID, seq: f.source.Seq(), deleted: f.source.Deleted()}
 		if f.opts.includeDocs {
 			var doc json.RawMessage
 			if err := f.source.ScanDoc(&doc); err != nil {

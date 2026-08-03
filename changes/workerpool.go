@@ -10,9 +10,14 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// Fetcher materialises a typed document from a doc ID emitted by a
-// change feed. WorkerPool retries the call with backoff on error.
-type Fetcher[T any] func(ctx context.Context, id string) (T, error)
+// Fetcher materialises a typed document from a change emitted by a feed.
+// WorkerPool retries the call with backoff on error.
+//
+// Deletions arrive here too, with Change.Deleted set. There is nothing left to
+// load in that case, so a fetcher should build whatever value represents "this
+// document is gone" for its own type rather than attempt a fetch that can only
+// fail — a retry loop on a tombstone would stall the shard indefinitely.
+type Fetcher[T any] func(ctx context.Context, c Change) (T, error)
 
 // KeyFunc extracts a partition key from a fetched item. Used by
 // hashed-mode pools to keep same-key items on the same worker.
@@ -178,26 +183,26 @@ func (p *WorkerPool[T]) runFetcher(ctx context.Context, shard string, f Feed) {
 		Factor: 2,
 	}
 	for {
-		id, err := f.Next(ctx)
+		c, err := f.Next(ctx)
 		if err != nil {
 			dur := bo.Duration()
 			log.Error().Err(err).Str("shard", shard).Dur("wait", dur).Msg("change feed read error, will retry after wait")
 			time.Sleep(dur)
 			continue
 		}
-		if id == "" {
+		if c.ID == "" {
 			log.Info().Str("shard", shard).Msg("change feed closed")
 			return
 		}
 
 		var item T
 		for {
-			item, err = p.fetcher(ctx, id)
+			item, err = p.fetcher(ctx, c)
 			if err == nil {
 				break
 			}
 			dur := bo.Duration()
-			log.Error().Err(err).Str("shard", shard).Str("id", id).Dur("wait", dur).Msg("fetch error, will retry after wait")
+			log.Error().Err(err).Str("shard", shard).Str("id", c.ID).Bool("deleted", c.Deleted).Dur("wait", dur).Msg("fetch error, will retry after wait")
 			time.Sleep(dur)
 		}
 		bo.Reset()

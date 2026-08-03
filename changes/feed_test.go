@@ -1,6 +1,7 @@
 package changes
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -49,6 +50,49 @@ func TestWithIncludeDocs_Sets(t *testing.T) {
 	WithIncludeDocs()(o)
 	if !o.includeDocs {
 		t.Fatalf("WithIncludeDocs should enable includeDocs")
+	}
+}
+
+func TestNext_ReportsDeletion(t *testing.T) {
+	f := newBareFeed()
+	f.started = true
+	f.outgoing = make(chan feedItem, 2)
+	f.outgoing <- feedItem{id: "doc-1", seq: "1", deleted: true}
+	f.outgoing <- feedItem{id: "doc-2", seq: "2"}
+
+	c, err := f.Next(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.ID != "doc-1" || !c.Deleted {
+		t.Fatalf("expected doc-1 reported as deleted, got %+v", c)
+	}
+
+	c, err = f.Next(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c.ID != "doc-2" || c.Deleted {
+		t.Fatalf("expected doc-2 reported as an update, got %+v", c)
+	}
+}
+
+func TestNextDoc_SkipsDeletions(t *testing.T) {
+	f := newBareFeed()
+	f.started = true
+	f.outgoing = make(chan feedItem, 3)
+	f.outgoing <- feedItem{id: "doc-1", seq: "1", deleted: true}
+	f.outgoing <- feedItem{id: "doc-2", seq: "2", deleted: true}
+	f.outgoing <- feedItem{id: "doc-3", seq: "3"}
+
+	// The deprecated path has no body to hand back for a tombstone, so it acks
+	// and moves on until it reaches a live document.
+	id, _, err := f.NextDoc(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if id != "doc-3" {
+		t.Fatalf("expected the deletions to be skipped, got %q", id)
 	}
 }
 
