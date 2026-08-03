@@ -22,7 +22,9 @@ go get github.com/invopop/couch
   idempotently (only rewritten when their views/filters change).
 - **`couch/changes`** — consume CouchDB `_changes` feeds with a resumable,
   persisted cursor and a worker pool.
-- **`couch/at`** — millisecond-precision timestamps used by `couch.Model`.
+- **[`invopop/at`](https://github.com/invopop/at)** — millisecond-precision
+  timestamps used by `couch.Model`. It lived here as `couch/at` until it was
+  moved out, so anything can use the type without depending on this library.
 
 ## Usage
 
