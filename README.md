@@ -94,6 +94,27 @@ if err := client.SyncDesigns(ctx, db, []*couch.Design{d}); err != nil {
 }
 ```
 
+### Databases by month
+
+For data that is only kept for a while, `MonthShards` keeps one database per
+calendar month and removes whole months once they are old enough, which is far
+cheaper than deleting the documents. Databases are created the first time they
+are written to, so nothing has to be migrated as months go by. The month comes
+from the model's `ShardValue`: a `time.Time` or a time-based UUID.
+
+```go
+shards := couch.NewMonthShards(client, "messages",
+	couch.WithMonthCreateOptions(kivik.Param("partitioned", true)))
+
+db, err := shards.For(ctx, msg)  // writes: creates <prefix>_messages_2026_11 if needed
+db, err = shards.Lookup(msg)     // reads: never creates, so a dropped month stays dropped
+
+// Remove every month that ended 30 or more days ago.
+dropped, err := shards.Drop(ctx, time.Now().AddDate(0, 0, -30))
+```
+
+`Drop` lists all databases to find the months, which needs a server admin.
+
 ### Change feeds
 
 See [`changes`](./changes) for consuming a database's `_changes` feed with a
