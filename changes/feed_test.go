@@ -16,6 +16,7 @@ func newBareFeed(opts ...Option) *feed {
 		saveTimeout: make(chan bool, 1),
 		opts:        newOptions(),
 		fatal:       make(chan error, 1),
+		done:        make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(f.opts)
