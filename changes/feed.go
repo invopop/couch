@@ -53,6 +53,8 @@ type Feed interface {
 	GetRev() string
 
 	// Start makes a request to the changes feed to start receiving updates.
+	// The feed stops when the context ends, exactly as if Stop were called,
+	// and cannot be started again.
 	Start(ctx context.Context)
 
 	// Seed overwrites the feed's persisted sequence position so a subsequent
@@ -138,10 +140,10 @@ type feed struct {
 
 	db          *kivik.DB
 	changesDB   *kivik.DB
-	source      *kivik.Changes
+	source      *kivik.Changes // owned by the connection loop
 	outgoing    chan feedItem
 	saveTimeout chan bool
-	started     bool
+	started     bool // guarded by state
 	lastSeq     string
 	lastID      string // doc ID paired with lastSeq (pending ack, Next mode only)
 	seqID       string // doc ID paired with Seq, surfaced in the "persisted feed" log
@@ -155,7 +157,19 @@ type feed struct {
 	fatal           chan error // signals unrecoverable conditions
 	fatalOnce       sync.Once  // guards send/close on fatal
 	stopOnce        sync.Once  // makes Stop idempotent
-	stopped         bool       // true once Stop has run; checked in Next
+
+	// state guards started, stopped and cancel, which Start, Stop and Next
+	// may touch from different goroutines. It is separate from the embedded
+	// Mutex because Next holds that one while it waits for a change.
+	state   sync.Mutex
+	stopped bool               // true once Stop has run; checked in Next
+	cancel  context.CancelFunc // ends the connection loop
+	done    chan struct{}      // closed by Stop
+
+	// seq guards the stored position (Seq, the document's revision, seqID
+	// and count). The consumer advances and saves it, and the connection
+	// loop reloads it before each reconnect.
+	seq sync.Mutex
 
 	log zerolog.Logger
 }
@@ -171,6 +185,7 @@ func New(changesDB, srcDB *kivik.DB, opts ...Option) Feed {
 		started:     false,
 		opts:        newOptions(),
 		fatal:       make(chan error, 1),
+		done:        make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -200,11 +215,13 @@ func (f *feed) prepareID() {
 func (f *feed) Seed(ctx context.Context, seq string) error {
 	f.Lock()
 	defer f.Unlock()
-	if f.started {
+	if started, _ := f.status(); started {
 		return errors.New("cannot seed a started feed")
 	}
 	// Load the current document (if any) so we update in place and keep its
 	// revision; a missing document is fine and will be created by store.
+	f.seq.Lock()
+	defer f.seq.Unlock()
 	if err := f.fetch(ctx); err != nil {
 		return err
 	}
@@ -218,11 +235,17 @@ func (f *feed) Seed(ctx context.Context, seq string) error {
 // establish change feed. If a callback is provided, this method
 // will block until the connection is stopped, or an error occurs.
 func (f *feed) Start(ctx context.Context) {
-	if f.started {
+	f.state.Lock()
+	if f.started || f.stopped {
+		f.state.Unlock()
 		return
 	}
+	// Stop ends the connection loop by cancelling this context, so the loop
+	// is the only goroutine that ever touches the source.
+	ctx, f.cancel = context.WithCancel(ctx)
 	f.outgoing = make(chan feedItem)
 	f.started = true
+	f.state.Unlock()
 	go f.connect(ctx)
 
 	if f.opts.callback != nil {
@@ -234,26 +257,35 @@ func (f *feed) Start(ctx context.Context) {
 // Stop stops the connection as gracefully as possible.
 func (f *feed) Stop() {
 	f.stopOnce.Do(func() {
+		f.state.Lock()
 		f.stopped = true
+		started := f.started
+		f.started = false
+		cancel := f.cancel
+		f.state.Unlock()
+
+		// Release a consumer waiting in Next.
+		close(f.done)
 		// Always close fatal so any waiting consumer is released, even
 		// if Start was never called or no fatal condition occurred.
 		f.fatalOnce.Do(func() { close(f.fatal) })
-		if !f.started {
+		if !started {
 			return
 		}
-		f.stopSaveTimer()
-		if f.source != nil {
-			// Kivik won't allow feed closure while a next call is
-			// blocking.
-			go func() {
-				_ = f.source.Close()
-				f.source = nil
-			}()
-		}
-		close(f.outgoing)
-		f.started = false
+		// The connection loop closes the source and the outgoing channel
+		// itself once it sees the cancellation. Doing either from here
+		// would race with the loop reading the source or sending a change.
+		cancel()
 		f.log.Info().Msg("stopped")
 	})
+}
+
+// status reports whether the feed has been started and whether it has been
+// stopped.
+func (f *feed) status() (started, stopped bool) {
+	f.state.Lock()
+	defer f.state.Unlock()
+	return f.started, f.stopped
 }
 
 // Fatal returns the channel that fires (and is then closed) when the
@@ -325,10 +357,11 @@ func (f *feed) nextItem(ctx context.Context) (feedItem, error) {
 
 	// If Stop has already run (including via a fatal self-stop), report
 	// a clean end-of-feed so iterators don't spin in a retry loop.
-	if f.stopped {
+	started, stopped := f.status()
+	if stopped {
 		return feedItem{}, nil
 	}
-	if !f.started {
+	if !started {
 		return feedItem{}, errors.New("not started")
 	}
 
@@ -346,6 +379,8 @@ func (f *feed) nextItem(ctx context.Context) (feedItem, error) {
 		select {
 		case <-ctx.Done():
 			return feedItem{}, ctx.Err()
+		case <-f.done:
+			return feedItem{}, nil // stopped
 		case item, more := <-f.outgoing:
 			if !more {
 				return feedItem{}, nil // the end
@@ -402,6 +437,8 @@ func (f *feed) startWithCallbacks() {
 // and arms the save timer. The id is retained only for observability —
 // it surfaces in the "persisted feed" log when the seq doc is written.
 func (f *feed) setSeq(id, seq string) {
+	f.seq.Lock()
+	defer f.seq.Unlock()
 	f.Seq = seq
 	if id != "" {
 		f.seqID = id
@@ -442,6 +479,8 @@ func (f *feed) shouldSave() bool {
 }
 
 func (f *feed) save(ctx context.Context) error {
+	f.seq.Lock()
+	defer f.seq.Unlock()
 	if !f.shouldSave() {
 		return nil
 	}
@@ -538,8 +577,16 @@ func leadingSeq(seq string) (int64, bool) {
 }
 
 // connect to source. This will enter a loop that attempts
-// to maintain the connection active.
+// to maintain the connection active until the context ends, which is what
+// Stop does. The loop owns the source and the outgoing channel: it is the
+// only goroutine that reads, replaces or closes them.
 func (f *feed) connect(ctx context.Context) {
+	defer close(f.outgoing)
+	defer f.closeSource()
+	// However the loop ends, the feed is finished: mark it stopped and
+	// release anyone waiting on Fatal. This is a no-op after a Stop.
+	defer f.Stop()
+
 	bo := &backoff.Backoff{
 		Min: 2 * time.Second,
 		Max: 2 * time.Minute,
@@ -548,21 +595,37 @@ func (f *feed) connect(ctx context.Context) {
 	for { // connection loop
 		err := f.fetchAndConnect(ctx)
 		if err == nil {
-			err = f.processNext()
-			if err == nil {
-				return // implies channel closed
-			}
+			err = f.processNext(ctx)
+		}
+		if ctx.Err() != nil {
+			return // stopped, or the caller's context ended
+		}
+		if err == nil {
+			// CouchDB ended the continuous feed without an error.
+			err = errors.New("changes feed closed by source")
 		}
 		d := bo.Duration()
 		f.log.Error().Dur("retry_in", d).Err(err).Msg("reconnecting...")
-		time.Sleep(d)
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
-func (f *feed) processNext() error {
+func (f *feed) closeSource() {
+	if f.source != nil {
+		_ = f.source.Close()
+		f.source = nil
+	}
+}
+
+func (f *feed) processNext(ctx context.Context) error {
 	for { // result loop
-		if !f.source.Next() {
-			return f.source.Err()
+		more, err := f.sourceNext()
+		if !more {
+			return err
 		}
 
 		docID := f.source.ID()
@@ -580,25 +643,56 @@ func (f *feed) processNext() error {
 				item.doc = doc
 			}
 		}
-		f.outgoing <- item
+		select {
+		case f.outgoing <- item:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+}
+
+// sourceNext moves the source to its next change. more is false when the
+// source has ended, with the reason if there is one.
+//
+// kivik (as of v4.5.2) panics when a continuous feed ends without an error,
+// because it reads a last_seq that continuous responses do not carry. That
+// would take the whole process down from this goroutine, so it is turned into
+// an error and the feed reconnects.
+func (f *feed) sourceNext() (more bool, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			more, err = false, fmt.Errorf("changes feed ended unexpectedly: %v", r)
+		}
+	}()
+	if f.source.Next() {
+		return true, nil
+	}
+	return false, f.source.Err()
 }
 
 func (f *feed) fetchAndConnect(ctx context.Context) error {
 	// attempt to clean up
-	if f.source != nil {
-		_ = f.source.Close()
-		f.source = nil
-	}
+	f.closeSource()
 
-	var err error
-	if err = f.fetch(ctx); err != nil {
+	// Reload the stored document, holding off the consumer while we do.
+	// Changes the consumer has acknowledged but not yet saved are ahead of
+	// what is stored, so keep the position in memory in that case rather
+	// than going back and delivering them again.
+	f.seq.Lock()
+	local, unsaved := f.Seq, f.count > 0
+	err := f.fetch(ctx)
+	if unsaved {
+		f.Seq = local
+	}
+	since := f.Seq
+	f.seq.Unlock()
+	if err != nil {
 		return err
 	}
 	params := map[string]any{
 		"include_docs": f.opts.includeDocs,
 		"heartbeat":    f.opts.heartbeat,
-		"since":        f.Seq,
+		"since":        since,
 		"feed":         "continuous",
 	}
 	if f.opts.seqInterval > 1 {
@@ -611,7 +705,7 @@ func (f *feed) fetchAndConnect(ctx context.Context) error {
 		}
 	}
 	f.source = f.db.Changes(ctx, kivik.Params(params))
-	f.log.Info().Str("seq", f.Seq).Msg("connected to changes feed")
+	f.log.Info().Str("seq", since).Msg("connected to changes feed")
 	return nil
 }
 

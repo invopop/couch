@@ -174,7 +174,8 @@ func (p *WorkerPool[T]) recv(workerID int) <-chan T {
 
 // runFetcher pulls IDs from one shard's feed, fetches the typed doc
 // for each, and dispatches it. Both feed reads and fetch errors are
-// retried with backoff.
+// retried with backoff, until the context given to Start ends: nothing
+// can succeed after that, so the fetcher gives up instead.
 func (p *WorkerPool[T]) runFetcher(ctx context.Context, shard string, f Feed) {
 	defer p.procWG.Done()
 	bo := &backoff.Backoff{
@@ -186,8 +187,14 @@ func (p *WorkerPool[T]) runFetcher(ctx context.Context, shard string, f Feed) {
 		c, err := f.Next(ctx)
 		if err != nil {
 			dur := bo.Duration()
+			if ctx.Err() != nil {
+				log.Info().Str("shard", shard).Msg("change feed context ended")
+				return
+			}
 			log.Error().Err(err).Str("shard", shard).Dur("wait", dur).Msg("change feed read error, will retry after wait")
-			time.Sleep(dur)
+			if !wait(ctx, dur) {
+				return
+			}
 			continue
 		}
 		if c.ID == "" {
@@ -203,7 +210,9 @@ func (p *WorkerPool[T]) runFetcher(ctx context.Context, shard string, f Feed) {
 			}
 			dur := bo.Duration()
 			log.Error().Err(err).Str("shard", shard).Str("id", c.ID).Bool("deleted", c.Deleted).Dur("wait", dur).Msg("fetch error, will retry after wait")
-			time.Sleep(dur)
+			if !wait(ctx, dur) {
+				return
+			}
 		}
 		bo.Reset()
 		p.dispatch(item)
@@ -225,4 +234,16 @@ func (p *WorkerPool[T]) watchFatal(shard string, f Feed) {
 		}
 		close(p.fatal)
 	})
+}
+
+// wait pauses for d, and reports false if the context ended first.
+func wait(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }

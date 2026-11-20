@@ -345,3 +345,48 @@ func TestWorkerPool_NonPositiveWorkersNormalised(t *testing.T) {
 		t.Fatalf("hashed: workers normalised to 1, got %d", p.Workers())
 	}
 }
+
+// stopsWithin fails the test unless the pool stops in good time: Stop waits
+// for the fetchers, so a fetcher that never gives up would hang it.
+func stopsWithin[T any](t *testing.T, pool *WorkerPool[T], d time.Duration) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		pool.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatal("pool did not stop: a fetcher is still retrying")
+	}
+}
+
+func TestWorkerPool_ContextEndStopsFeedRetries(t *testing.T) {
+	// The feed has nothing to deliver, so the fetcher waits in Next and
+	// gets the context's error when it ends.
+	pool := NewFlatWorkerPool(map[string]Feed{"test": newFakeFeed("test")},
+		func(_ context.Context, c Change) (string, error) { return c.ID, nil }, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	pool.Start(ctx)
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	stopsWithin(t, pool, time.Second)
+}
+
+func TestWorkerPool_ContextEndStopsFetchRetries(t *testing.T) {
+	var attempts atomic.Int32
+	pool := NewFlatWorkerPool(map[string]Feed{"test": newFakeFeed("test", "doc-1")},
+		func(ctx context.Context, _ Change) (string, error) {
+			attempts.Add(1)
+			return "", errors.New("unavailable")
+		}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	pool.Start(ctx)
+	waitUntil(t, time.Second, func() bool { return attempts.Load() > 0 }, "first fetch attempt")
+	cancel()
+	stopsWithin(t, pool, time.Second)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("expected no further fetch attempts, got %d", got)
+	}
+}
