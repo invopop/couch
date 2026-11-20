@@ -94,11 +94,23 @@ func (s *MonthShards) For(ctx context.Context, m Shardable) (*kivik.DB, error) {
 			return nil, fmt.Errorf("creating %s: %w", db.Name(), err)
 		}
 	}
-	if err := s.client.SyncDesigns(ctx, db, s.designs); err != nil {
+	if err := s.syncDesigns(ctx, db); err != nil {
 		return nil, fmt.Errorf("syncing designs to %s: %w", db.Name(), err)
 	}
 	s.ready[key] = db
 	return db, nil
+}
+
+// syncDesigns stores the design documents in a month's database. Another
+// instance using the month for the first time may store the same design at
+// the same moment, in which case ours conflicts: syncing again then finds
+// theirs in place and has nothing to do.
+func (s *MonthShards) syncDesigns(ctx context.Context, db *kivik.DB) error {
+	err := s.client.SyncDesigns(ctx, db, s.designs)
+	if errors.Is(err, ErrAlreadyExists) || kivik.HTTPStatus(err) == http.StatusConflict {
+		err = s.client.SyncDesigns(ctx, db, s.designs)
+	}
+	return err
 }
 
 // Lookup provides the database for the model's month without creating it.
@@ -133,6 +145,10 @@ func (s *MonthShards) Names(ctx context.Context) ([]string, error) {
 // time, and provides the names of those it removed. To keep documents for at
 // least 30 days, call it with the time 30 days ago: a month goes once its
 // last day is that old.
+//
+// Other instances are not told: one that has already used a dropped month
+// will find it missing on its next write. Only drop months that nothing
+// writes to any more.
 func (s *MonthShards) Drop(ctx context.Context, before time.Time) ([]string, error) {
 	names, err := s.Names(ctx)
 	if err != nil {
@@ -144,16 +160,25 @@ func (s *MonthShards) Drop(ctx context.Context, before time.Time) ([]string, err
 		if start.AddDate(0, 1, 0).After(before) {
 			continue
 		}
-		err := s.client.client.DestroyDB(ctx, name)
-		if err != nil && kivik.HTTPStatus(err) != http.StatusNotFound {
+		if err := s.destroy(ctx, name, monthKey(start)); err != nil {
 			return dropped, fmt.Errorf("dropping %s: %w", name, err)
 		}
-		s.mu.Lock()
-		delete(s.ready, monthKey(start))
-		s.mu.Unlock()
 		dropped = append(dropped, name)
 	}
 	return dropped, nil
+}
+
+// destroy removes a month's database and forgets it, holding the lock so that
+// a For on this instance cannot recreate the month in between.
+func (s *MonthShards) destroy(ctx context.Context, name, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err := s.client.client.DestroyDB(ctx, name)
+	if err != nil && kivik.HTTPStatus(err) != http.StatusNotFound {
+		return err
+	}
+	delete(s.ready, key)
+	return nil
 }
 
 func (s *MonthShards) db(key string) *kivik.DB {
