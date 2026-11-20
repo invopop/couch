@@ -674,9 +674,16 @@ func (f *feed) fetchAndConnect(ctx context.Context) error {
 	// attempt to clean up
 	f.closeSource()
 
-	// Reload the stored position, holding off the consumer while we do.
+	// Reload the stored document, holding off the consumer while we do.
+	// Changes the consumer has acknowledged but not yet saved are ahead of
+	// what is stored, so keep the position in memory in that case rather
+	// than going back and delivering them again.
 	f.seq.Lock()
+	local, unsaved := f.Seq, f.count > 0
 	err := f.fetch(ctx)
+	if unsaved {
+		f.Seq = local
+	}
 	since := f.Seq
 	f.seq.Unlock()
 	if err != nil {

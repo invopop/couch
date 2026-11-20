@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +24,11 @@ type fakeCouch struct {
 	// endFirst makes the first changes response end once its changes are
 	// sent, the way a proxy or a restarting node would cut it short.
 	endFirst bool
+	// stored is the position held by the feed document, if there is one.
+	stored string
+
+	mu    sync.Mutex
+	since []string // the position each connection asked to start from
 }
 
 func newFakeCouch(t *testing.T, changes int) *fakeCouch {
@@ -32,6 +38,9 @@ func newFakeCouch(t *testing.T, changes int) *fakeCouch {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/_changes"):
+			fc.mu.Lock()
+			fc.since = append(fc.since, r.URL.Query().Get("since"))
+			fc.mu.Unlock()
 			n := fc.connections.Add(1)
 			w.WriteHeader(http.StatusOK)
 			if n == 1 || !fc.endFirst {
@@ -47,6 +56,8 @@ func newFakeCouch(t *testing.T, changes int) *fakeCouch {
 		case r.Method == http.MethodPut:
 			w.WriteHeader(http.StatusCreated)
 			_, _ = w.Write([]byte(`{"ok":true,"id":"feed","rev":"1-a"}`))
+		case r.Method == http.MethodGet && fc.stored != "":
+			_, _ = fmt.Fprintf(w, `{"_id":"source","_rev":"1-a","seq":%q}`, fc.stored)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":"not_found","reason":"missing"}`))
@@ -175,6 +186,7 @@ func TestStart_ContextCancelled(t *testing.T) {
 func TestReconnect_WhileConsuming(t *testing.T) {
 	fc := newFakeCouch(t, 2)
 	fc.endFirst = true
+	fc.stored = "1-x" // doc-1 was saved by an earlier run
 	f := fc.feed(t)
 	ctx := context.Background()
 	f.Start(ctx)
@@ -205,6 +217,15 @@ func TestReconnect_WhileConsuming(t *testing.T) {
 		t.Fatalf("expected a zero change after Stop, got %+v", c)
 	}
 	waitClosed(t, f)
+
+	// The first connection resumes from what was stored. By the second,
+	// doc-2 has been acknowledged but not saved: resume after it rather
+	// than from the stored position, which would deliver it again.
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.since) != 2 || fc.since[0] != "1-x" || fc.since[1] != "2-x" {
+		t.Fatalf("expected connections from 1-x then 2-x, got %v", fc.since)
+	}
 }
 
 func TestStart_AfterStop(t *testing.T) {
